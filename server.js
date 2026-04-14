@@ -59,7 +59,7 @@ Return ONLY valid JSON. No markdown, no explanation, no extra text.
 
 {
   "mainPitch": "The single best version of their pitch. This is the primary output.",
-  "deepVersion": "A 3-5 sentence structured version (problem → value → impact). Only include this if their input was rich enough to support it. If not needed, return an empty string.",
+  "deepVersion": "A 3-5 sentence structured version (problem to value to impact). Only include this if their input was rich enough to support it. If not needed, return an empty string.",
   "variations": {
     "simpler": "A cleaner, shorter version. Strip everything non-essential.",
     "casual": "Conversational. Something they would actually say out loud at a networking event.",
@@ -87,7 +87,7 @@ app.post('/pitch', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5-20251001',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 1000,
         system: buildSystemPrompt(userType, confidenceBoost),
         messages: [{ role: 'user', content: userMessage }]
@@ -152,7 +152,7 @@ Rules:
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5-20251001',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 500,
         system,
         messages: [{ role: 'user', content: userMessage }]
@@ -213,7 +213,7 @@ Rules:
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5-20251001',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 600,
         system,
         messages: [{ role: 'user', content: userMessage }]
