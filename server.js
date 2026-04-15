@@ -5,11 +5,19 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ─── Config ───────────────────────────────────────────────
+const CLIENT_ID = process.env.JIRA_CLIENT_ID;
+const CLIENT_SECRET = process.env.JIRA_CLIENT_SECRET;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://pitchyou.netlify.app';
+const CALLBACK_URL = 'https://weekly-pulse.onrender.com/callback';
+const FRONTEND_URL = 'https://pitchyou.netlify.app';
+const CLOUD_ID = '85ac1498-4a4c-49a5-a04f-22069874b42a';
 
-// ─── Middleware ───────────────────────────────────────────
-app.use(cors({ origin: FRONTEND_URL }));
+// ─── Middleware ────────────────────────────────────────────
+app.use(cors({
+  origin: FRONTEND_URL,
+  credentials: true
+}));
 app.use(express.json());
 
 // ─── Health Check ─────────────────────────────────────────
@@ -17,250 +25,388 @@ app.get('/', (req, res) => {
   res.json({ status: 'PitchYou backend is running' });
 });
 
-// ─── Build System Prompt ──────────────────────────────────
-function buildSystemPrompt(userType, confidenceBoost) {
+// ─── Helper: Anthropic API call ───────────────────────────
+async function callAnthropic(systemPrompt, userPrompt, maxTokens = 1000) {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }]
+    })
+  });
 
-  const toneMap = {
-    job_seeker: `This person is looking for a job. Their pitch needs to make a hiring manager or recruiter immediately think "I want to talk to this person." Focus on what they bring, what problems they solve, and what they have already done. Make it sound like someone who gets things done, not someone who is hoping to get a chance.`,
-    freelancer: `This person is a freelancer or consultant looking for clients. Their pitch needs to make a potential client think "this person gets exactly what I need." Focus on the result the client gets, not the service being offered. Make it outcome-first, not process-first.`,
-    founder: `This person is building a company. Their pitch needs to make an investor, partner, or early customer think "this is a real problem and this person knows how to solve it." Lead with the problem in a way that feels urgent and real. Then show why this person is the right one to fix it.`,
-    student: `This person is a student building their early career. Their pitch needs to make someone think "this person is sharp and going somewhere." Focus on what they have already done, how they think, and where they are headed. Avoid sounding like a CV. Sound like someone who takes initiative.`,
-    intro: `This person is introducing themselves in a general context. Their pitch needs to make someone think "I want to know more about this person." Make it clear, interesting, and specific enough to be memorable.`
-  };
-
-  const tone = toneMap[userType] || toneMap['intro'];
-  const confidenceInstruction = confidenceBoost
-    ? `Confidence level is HIGH. Every sentence should feel like it was said by someone who knows exactly what they are worth. No hedging. No softening. Direct, authoritative, and assured.`
-    : `Confidence level is neutral. Clear and direct. Friendly but not timid.`;
-
-  return `You are a world-class pitch strategist. You have spent years studying why some pitches make people lean in and others get ignored. You know the difference between a pitch that sounds good and a pitch that actually converts.
-
-Your job is to take rough, messy, incomplete input and turn it into a pitch that makes the listener feel something immediately. Not just understand something. Feel something.
-
-${tone}
-
-${confidenceInstruction}
-
-WHAT MAKES A PITCH ACTUALLY WORK:
-A pitch that converts does three things fast:
-1. It makes the listener recognise a problem or desire they already have
-2. It shows this person is the solution to that problem, with specifics
-3. It ends with something that makes them want to take the next step
-
-WHAT KILLS A PITCH:
-- Opening with "I am a..." or "Hi, my name is..." (start with value, not identity)
-- Being vague: "I help companies grow" tells nobody anything
-- Describing tasks instead of outcomes: "I manage projects" vs "I get projects finished on time"
-- Sounding like a job description
-- Buzzwords: passionate, innovative, game-changing, leverage, synergy, driven, dynamic, dedicated, results-oriented, world-class
-- Weak closes that trail off with no direction
-
-PROCESSING RULES:
-- Read what they wrote. Find the real value underneath it, even if they did not say it clearly
-- Upgrade every weak phrase to a specific outcome: "help teams" becomes "cut the back-and-forth that slows teams down"
-- If they gave proof (numbers, results, clients), use it. Specific beats vague every time
-- If they did not give proof, infer something credible and logical from what they said
-- Never copy their input word for word. Always rewrite into something sharper
-- Remove all filler: "I am really passionate about", "I have always loved", "I believe that"
-- Keep sentences short. One idea per sentence. No sentence should need to be read twice.
-
-CRITICAL FORMATTING RULES - YOU MUST FOLLOW THESE EXACTLY:
-- NEVER use an em dash (the long dash that looks like this: --). Not once. Not anywhere. This is non-negotiable.
-- NEVER use a hyphen to connect two clauses. Use a period instead.
-- No bullet points inside the pitch
-- No bold or italic text
-- No quotation marks around the pitch
-
-LENGTH:
-- If their input is short and simple: 2 sentences maximum
-- If their input includes context, proof, or multiple services: 3 to 4 sentences
-- Never go beyond 4 sentences. A pitch is not an essay.
-
-OUTPUT FORMAT:
-Return ONLY valid JSON. No markdown. No explanation. No extra text outside the JSON.
-
-{
-  "mainPitch": "The pitch. Written as plain text. No dashes. No bullets. No formatting marks."
-}`;
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content[0].text;
 }
 
-// ─── POST /pitch ──────────────────────────────────────────
-app.post('/pitch', async (req, res) => {
+// ─── POST /generate ───────────────────────────────────────
+app.post('/generate', async (req, res) => {
   const { userType, box1, box2, confidenceBoost } = req.body;
 
-  if (!box1 || box1.trim().length < 10) {
-    return res.status(400).json({ error: 'Please add more about what you do.' });
+  if (!box1 || !box1.trim()) {
+    return res.status(400).json({ error: 'box1 is required' });
   }
 
-  const userMessage = `What I do:\n${box1.trim()}${box2 && box2.trim() ? '\n\nResults and experience:\n' + box2.trim() : ''}`;
+  const confidenceNote = confidenceBoost
+    ? 'The person wants a confident, assertive tone. Make everything stronger and more direct.'
+    : '';
+
+  const systemPrompt = `You generate sharp personal pitch content. Follow these rules exactly:
+- Sound like a human talking to a human. Never like a brand.
+- Start with value, not "I am a" or "Hi my name is"
+- Convert tasks into outcomes: "I manage projects" becomes "I help teams finish on time"
+- Use their specific details. Vague kills pitches.
+- Never use: passionate, innovative, game-changing, leverage, synergy, driven, dynamic, dedicated, results-oriented, world-class
+- Never use em dashes. Use a period instead.
+- No bullet points inside pitch text
+- Short sentences beat long ones
+- Try to extract the person's first name from the input. If you cannot find one, return null for the name field.
+${confidenceNote}
+
+Return ONLY valid JSON. No markdown fences. No explanation. No preamble.`;
+
+  const userPrompt = `Person type: ${userType || 'Professional'}
+
+What they do and who they help:
+${box1}
+
+${box2 ? `Results or experience:\n${box2}` : 'No additional context provided.'}
+
+Generate this exact JSON structure:
+{
+  "name": "their first name if found in the input, otherwise null",
+  "headline": "one punchy line under 10 words that captures who they are",
+  "mainPitch": "1-4 sentences. Starts with value. Specific. No buzzwords.",
+  "bio": "2-3 sentences. Third person. Professional but human.",
+  "qaContext": [
+    {"q": "realistic question a visitor would ask", "a": "answer in their voice, first person, 2-3 sentences, confident"},
+    {"q": "...", "a": "..."},
+    {"q": "...", "a": "..."},
+    {"q": "...", "a": "..."},
+    {"q": "...", "a": "..."}
+  ]
+}`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 600,
-        system: buildSystemPrompt(userType, confidenceBoost),
-        messages: [{ role: 'user', content: userMessage }]
-      })
+    console.log('Generating pitch for:', userType, '| box1 length:', box1.length);
+
+    const raw = await callAnthropic(systemPrompt, userPrompt, 1800);
+
+    // Strip markdown fences and em dashes as safety net
+    const cleaned = raw
+      .replace(/```json\n?/g, '')
+      .replace(/```\n?/g, '')
+      .replace(/\u2014/g, '.')
+      .replace(/--/g, '.')
+      .trim();
+
+    const result = JSON.parse(cleaned);
+
+    console.log('Pitch generated for:', result.name || '(no name found)');
+
+    res.json({
+      name: result.name || null,
+      headline: result.headline,
+      mainPitch: result.mainPitch,
+      bio: result.bio,
+      qaContext: result.qaContext || []
     });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('Anthropic API error:', data);
-      return res.status(500).json({ error: 'Failed to generate pitch. Try again.' });
-    }
-
-    const raw = data.content?.[0]?.text || '';
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
-
-    // Strip any em dashes that slipped through
-    parsed.mainPitch = parsed.mainPitch.replace(/\u2014/g, '.').replace(/--/g, '.').trim();
-
-    res.json(parsed);
-
   } catch (err) {
-    console.error('Server error:', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    console.error('Generate error:', err);
+    res.status(500).json({ error: 'Failed to generate pitch', details: err.message });
   }
 });
 
-// ─── POST /refine ─────────────────────────────────────────
-app.post('/refine', async (req, res) => {
-  const { currentPitch, instruction, userType, confidenceBoost } = req.body;
+// ─── POST /ask ────────────────────────────────────────────
+app.post('/ask', async (req, res) => {
+  const { personContext, question } = req.body;
 
-  if (!currentPitch || !instruction) {
-    return res.status(400).json({ error: 'Missing pitch or instruction.' });
+  if (!question || !personContext) {
+    return res.status(400).json({ error: 'question and personContext are required' });
   }
 
-  const toneMap = {
-    job_seeker: 'job seeker, professional and clear',
-    freelancer: 'freelancer, results-focused',
-    founder: 'founder, vision and impact',
-    student: 'student, growth-focused',
-    intro: 'general introduction, confident and approachable'
-  };
+  const { name, userType, headline, mainPitch, bio, qaContext, rawInput } = personContext;
+  const displayName = name || 'this person';
 
-  const tone = toneMap[userType] || toneMap['intro'];
-
-  const system = `You are a pitch editor. Apply the requested change to this pitch.
-The person is a ${tone}.
-${confidenceBoost ? 'Keep the high-confidence tone.' : ''}
-
+  const systemPrompt = `You are answering questions on behalf of a specific person. You speak as them, in first person.
 Rules:
-- Apply the instruction faithfully
-- Keep it human. No buzzwords.
-- NEVER use an em dash or double hyphen. Use a period instead.
-- No bullet points.
-- Return ONLY valid JSON: {"refinedPitch": "..."}`;
+- Use only what is provided, plus logical inference
+- Never invent credentials, companies, or specific facts not in the context
+- Keep answers to 2-3 sentences maximum
+- Sound like someone confident answering a question at a networking event. Not a bot.
+- No bullet points. No em dashes. Short sentences.
+- If you truly do not know something, say so briefly and pivot to what you do know.
+- Return only the answer text. No preamble. No opener like "As ${displayName}".`;
 
-  const userMessage = `Current pitch:\n"${currentPitch}"\n\nInstruction: ${instruction}`;
+  const contextParts = [
+    `About ${displayName}:`,
+    `Type: ${userType || 'Professional'}`,
+    `Headline: ${headline}`,
+    `Main pitch: ${mainPitch}`,
+    `Bio: ${bio}`,
+    rawInput?.box1 ? `What they do: ${rawInput.box1}` : '',
+    rawInput?.box2 ? `Background/results: ${rawInput.box2}` : '',
+    qaContext?.length > 0
+      ? `Additional context:\n${qaContext.map(qa => `Q: ${qa.q}\nA: ${qa.a}`).join('\n\n')}`
+      : ''
+  ].filter(Boolean).join('\n');
+
+  const userPrompt = `${contextParts}
+
+Visitor's question: ${question}
+
+Answer in first person as ${displayName}. 2-3 sentences maximum.`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 400,
-        system,
-        messages: [{ role: 'user', content: userMessage }]
-      })
-    });
+    const raw = await callAnthropic(systemPrompt, userPrompt, 300);
 
-    const data = await response.json();
+    const answer = raw
+      .replace(/\u2014/g, '.')
+      .replace(/--/g, '.')
+      .trim();
 
-    if (!response.ok) {
-      return res.status(500).json({ error: 'Failed to refine pitch. Try again.' });
-    }
+    console.log('Question answered for:', displayName);
 
-    const raw = data.content?.[0]?.text || '';
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
-
-    parsed.refinedPitch = parsed.refinedPitch.replace(/\u2014/g, '.').replace(/--/g, '.').trim();
-
-    res.json(parsed);
-
+    res.json({ answer });
   } catch (err) {
-    console.error('Refine error:', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    console.error('Ask error:', err);
+    res.status(500).json({ error: 'Failed to generate answer', details: err.message });
   }
 });
 
-// ─── POST /convert ────────────────────────────────────────
-app.post('/convert', async (req, res) => {
-  const { currentPitch, originalInput, context, userType } = req.body;
+// ─── OAuth: Step 1 — Redirect user to Atlassian ──────────
+app.get('/auth', (req, res) => {
+  const scopes = [
+    'read:jira-work',
+    'read:jira-user',
+    'read:issue:jira',
+    'read:project:jira',
+    'read:issue-details:jira',
+    'read:jql:jira',
+    'read:sprint:jira-software',
+    'read:board-scope:jira-software',
+    'read:user:jira',
+    'offline_access'
+  ].join(' ');
 
-  if (!currentPitch || !context) {
-    return res.status(400).json({ error: 'Missing pitch or context.' });
+  const authUrl = `https://auth.atlassian.com/authorize?audience=api.atlassian.com&client_id=${CLIENT_ID}&scope=${encodeURIComponent(scopes)}&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&response_type=code&prompt=consent`;
+
+  console.log('Redirecting to Atlassian OAuth...');
+  res.redirect(authUrl);
+});
+
+// ─── OAuth: Step 2 — Exchange code for token ──────────────
+app.get('/callback', async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    console.error('No auth code received');
+    return res.redirect(`${FRONTEND_URL}#error=no_code`);
   }
 
-  const contextMap = {
-    linkedin: 'a LinkedIn bio. Written, professional, third person is fine. Ends with a line that makes someone want to connect or reach out. No em dashes.',
-    elevator: 'a spoken elevator pitch. Natural, conversational, 30 seconds when read aloud. Ends with a clear next step or ask. No em dashes.',
-    cover_letter: 'the opening paragraph of a cover letter. Human but focused. Grabs attention in the first sentence. Sets up immediately why this person is the right fit. No em dashes.',
-    investor: 'an investor pitch intro. Opens with the problem in a way that feels urgent and real. Then the solution. Then why this person. Ends with what they are looking for. No em dashes.'
-  };
-
-  const format = contextMap[context];
-  if (!format) return res.status(400).json({ error: 'Invalid context type.' });
-
-  const system = `You are a pitch writer. Rewrite the pitch for a specific new format and context.
-Rules:
-- Sound like a human, not a brand
-- Keep the person's specific details and proof
-- No buzzwords
-- NEVER use an em dash or double hyphen. Use a period instead.
-- No bullet points
-- Return ONLY valid JSON: {"convertedPitch": "..."}`;
-
-  const userMessage = `Original input:\n${originalInput || currentPitch}\n\nCurrent pitch:\n"${currentPitch}"\n\nRewrite this as: ${format}`;
-
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    console.log('Exchanging auth code for token...');
+
+    const tokenRes = await fetch('https://auth.atlassian.com/oauth/token', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 500,
-        system,
-        messages: [{ role: 'user', content: userMessage }]
+        grant_type: 'authorization_code',
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        code: code,
+        redirect_uri: CALLBACK_URL
       })
     });
 
-    const data = await response.json();
+    const tokenData = await tokenRes.json();
 
-    if (!response.ok) {
-      return res.status(500).json({ error: 'Failed to convert pitch. Try again.' });
+    if (tokenData.error) {
+      console.error('Token error:', tokenData);
+      return res.redirect(`${FRONTEND_URL}#error=${tokenData.error}`);
     }
 
-    const raw = data.content?.[0]?.text || '';
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
+    console.log('Token obtained successfully');
+    console.log('Scopes granted:', tokenData.scope);
 
-    parsed.convertedPitch = parsed.convertedPitch.replace(/\u2014/g, '.').replace(/--/g, '.').trim();
+    const params = new URLSearchParams({
+      access_token: tokenData.access_token,
+      token_type: tokenData.token_type || 'Bearer'
+    });
 
-    res.json(parsed);
+    if (tokenData.refresh_token) {
+      params.append('refresh_token', tokenData.refresh_token);
+    }
 
+    res.redirect(`${FRONTEND_URL}#${params.toString()}`);
   } catch (err) {
-    console.error('Convert error:', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    console.error('OAuth callback error:', err);
+    res.redirect(`${FRONTEND_URL}#error=token_exchange_failed`);
+  }
+});
+
+// ─── Helper: Extract Bearer token ─────────────────────────
+function getToken(req) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return null;
+  return auth.split(' ')[1];
+}
+
+// ─── Jira: Fetch issues ────────────────────────────────────
+app.get('/jira/issues', async (req, res) => {
+  const token = getToken(req);
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    console.log('Fetching Jira issues...');
+
+    const jql = encodeURIComponent('project = SCRUM ORDER BY updated DESC');
+    const fields = 'summary,status,description,assignee,priority,created,updated,sprint';
+    const url = `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/search?jql=${jql}&maxResults=50&fields=${fields}`;
+
+    const issuesRes = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    });
+
+    const issuesData = await issuesRes.json();
+    console.log('Total issues found:', issuesData.total);
+
+    if (issuesData.total === 0) {
+      console.log('Zero issues with project filter. Trying broad query...');
+
+      const fallbackUrl = `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/search?jql=${encodeURIComponent('ORDER BY updated DESC')}&maxResults=50&fields=${fields}`;
+      const fallbackRes = await fetch(fallbackUrl, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+      });
+      const fallbackData = await fallbackRes.json();
+      console.log('Fallback total:', fallbackData.total);
+
+      if (fallbackData.total > 0) {
+        return res.json(categorizeIssues(fallbackData));
+      }
+    }
+
+    res.json(categorizeIssues(issuesData));
+  } catch (err) {
+    console.error('Error fetching issues:', err);
+    res.status(500).json({ error: 'Failed to fetch issues', details: err.message });
+  }
+});
+
+// ─── Helper: Categorize issues by status ──────────────────
+function categorizeIssues(issuesData) {
+  const toDo = [], inProgress = [], done = [], blocked = [];
+
+  if (issuesData.issues && issuesData.issues.length > 0) {
+    issuesData.issues.forEach(issue => {
+      const statusName = issue.fields.status?.name?.toLowerCase() || '';
+      const statusCategory = issue.fields.status?.statusCategory?.key?.toLowerCase() || '';
+
+      const item = {
+        key: issue.key,
+        summary: issue.fields.summary,
+        status: issue.fields.status?.name,
+        statusCategory: issue.fields.status?.statusCategory?.name,
+        assignee: issue.fields.assignee?.displayName || 'Unassigned',
+        priority: issue.fields.priority?.name || 'None',
+        description: issue.fields.description,
+        created: issue.fields.created,
+        updated: issue.fields.updated
+      };
+
+      if (statusName.includes('block')) {
+        blocked.push(item);
+      } else if (statusCategory === 'done' || statusName === 'done') {
+        done.push(item);
+      } else if (statusCategory === 'indeterminate' || statusName === 'in progress' || statusName.includes('progress')) {
+        inProgress.push(item);
+      } else {
+        toDo.push(item);
+      }
+    });
+  }
+
+  return { total: issuesData.total || 0, toDo, inProgress, done, blocked };
+}
+
+// ─── Debug endpoints ───────────────────────────────────────
+app.get('/debug-jira', async (req, res) => {
+  const token = getToken(req);
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    const resourcesRes = await fetch('https://api.atlassian.com/oauth/token/accessible-resources', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    });
+    const resources = await resourcesRes.json();
+
+    const scopeRes = await fetch('https://api.atlassian.com/me', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    });
+    const me = await scopeRes.json();
+
+    res.json({
+      user: me,
+      accessibleResources: resources,
+      cloudIdUsed: CLOUD_ID,
+      cloudIdMatch: resources.some(r => r.id === CLOUD_ID)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/debug-projects', async (req, res) => {
+  const token = getToken(req);
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    const response = await fetch(
+      `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/project`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+    );
+    const data = await response.json();
+    res.json({ count: Array.isArray(data) ? data.length : 0, projects: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/debug-issue/:issueKey', async (req, res) => {
+  const token = getToken(req);
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    const response = await fetch(
+      `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/issue/${req.params.issueKey}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+    );
+    res.json(await response.json());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/debug-permissions', async (req, res) => {
+  const token = getToken(req);
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    const response = await fetch(
+      `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/mypermissions?permissions=BROWSE_PROJECTS,READ_PROJECT,VIEW_WORKFLOW_READONLY`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+    );
+    res.json(await response.json());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -268,4 +414,6 @@ Rules:
 app.listen(PORT, () => {
   console.log(`PitchYou backend running on port ${PORT}`);
   console.log(`Frontend: ${FRONTEND_URL}`);
+  console.log(`Callback: ${CALLBACK_URL}`);
+  console.log(`Cloud ID: ${CLOUD_ID}`);
 });
