@@ -5,28 +5,24 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Config ───────────────────────────────────────────────
-const CLIENT_ID = process.env.JIRA_CLIENT_ID;
-const CLIENT_SECRET = process.env.JIRA_CLIENT_SECRET;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const CALLBACK_URL = 'https://weekly-pulse.onrender.com/callback';
-const FRONTEND_URL = 'https://pitchyou.netlify.app';
-const CLOUD_ID = '85ac1498-4a4c-49a5-a04f-22069874b42a';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://pitchyou.netlify.app';
 
-// ─── Middleware ────────────────────────────────────────────
-app.use(cors({
-  origin: FRONTEND_URL,
-  credentials: true
-}));
+app.use(cors({ origin: FRONTEND_URL }));
 app.use(express.json());
 
-// ─── Health Check ─────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'PitchYou backend is running' });
 });
 
-// ─── Helper: Anthropic API call ───────────────────────────
-async function callAnthropic(systemPrompt, userPrompt, maxTokens = 1000) {
+// ─── Helper: strip em dashes ──────────────────────────────
+function cleanText(str) {
+  if (!str) return '';
+  return str.replace(/\u2014/g, '.').replace(/\u2013/g, '-').replace(/--/g, '.').trim();
+}
+
+// ─── Helper: call Anthropic ───────────────────────────────
+async function callAnthropic(system, userMessage, maxTokens = 800) {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -37,383 +33,135 @@ async function callAnthropic(systemPrompt, userPrompt, maxTokens = 1000) {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: maxTokens,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userPrompt }]
+      system,
+      messages: [{ role: 'user', content: userMessage }]
     })
   });
 
   const data = await response.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.content[0].text;
+
+  if (!response.ok) {
+    console.error('Anthropic error:', data);
+    throw new Error(data.error?.message || 'Anthropic API error');
+  }
+
+  const raw = data.content?.[0]?.text || '';
+  return raw.replace(/```json|```/g, '').trim();
 }
 
 // ─── POST /generate ───────────────────────────────────────
 app.post('/generate', async (req, res) => {
-  const { userType, box1, box2, confidenceBoost } = req.body;
+  const { userType, box1, box2, name, confidenceBoost } = req.body;
 
-  if (!box1 || !box1.trim()) {
-    return res.status(400).json({ error: 'box1 is required' });
+  if (!box1 || box1.trim().length < 10) {
+    return res.status(400).json({ error: 'Please add more about what you do.' });
   }
 
-  const confidenceNote = confidenceBoost
-    ? 'The person wants a confident, assertive tone. Make everything stronger and more direct.'
-    : '';
+  const toneMap = {
+    job_seeker: 'a job seeker. Their pitch must make a recruiter or hiring manager immediately think "I need to speak to this person." Focus on what they deliver and what they have already done. Make them sound like someone who gets things done.',
+    freelancer: 'a freelancer or consultant. Their pitch must make a potential client think "this person gets exactly what I need." Lead with outcomes, not services. The client hires results, not a process.',
+    founder: 'a startup founder. Their pitch must make an investor or partner think "this is a real problem and this person knows how to solve it." Open with the problem feeling urgent. Show why this specific person is the right one.',
+    student: 'a student building their early career. Their pitch must make someone think "this person is sharp and going somewhere." Show initiative and direction. Avoid sounding like a CV.',
+    intro: 'someone introducing themselves. Their pitch must make someone think "I want to know more about this person." Clear, interesting, and specific enough to be memorable.'
+  };
 
-  const systemPrompt = `You generate sharp personal pitch content. Follow these rules exactly:
-- Sound like a human talking to a human. Never like a brand.
-- Start with value, not "I am a" or "Hi my name is"
-- Convert tasks into outcomes: "I manage projects" becomes "I help teams finish on time"
-- Use their specific details. Vague kills pitches.
+  const tone = toneMap[userType] || toneMap['intro'];
+  const conf = confidenceBoost
+    ? 'Confidence is HIGH. Every sentence should feel like it was said by someone who knows exactly what they are worth. No hedging. Authoritative.'
+    : 'Confidence is neutral. Clear and direct without overselling.';
+
+  const system = `You are a world-class pitch strategist. You turn rough descriptions into pitches that make people stop and pay attention.
+
+The person is ${tone}
+
+${conf}
+
+WHAT MAKES A PITCH WORK:
+1. Opens with value or a result — never with "I am a" or "Hi my name is"
+2. Is specific enough to be credible — vague pitches get ignored
+3. Makes the listener feel something — curiosity, recognition, desire
+4. Ends with direction — what the person wants next
+
+RULES — ALL NON-NEGOTIABLE:
 - Never use: passionate, innovative, game-changing, leverage, synergy, driven, dynamic, dedicated, results-oriented, world-class
-- Never use em dashes. Use a period instead.
-- No bullet points inside pitch text
-- Short sentences beat long ones
-- Try to extract the person's first name from the input. If you cannot find one, return null for the name field.
-${confidenceNote}
+- NEVER use em dashes (—). Use a period instead. This is absolute.
+- No bullet points inside any text field
+- Short sentences. One idea per sentence.
+- Convert tasks to outcomes: "I manage projects" becomes "I help teams finish on time"
+- If input is vague, infer logically. Never ask follow-up questions.
+- Do not copy input word for word. Always rewrite sharper.
 
-Return ONLY valid JSON. No markdown fences. No explanation. No preamble.`;
+Return ONLY valid JSON. No markdown. No explanation.
 
-  const userPrompt = `Person type: ${userType || 'Professional'}
-
-What they do and who they help:
-${box1}
-
-${box2 ? `Results or experience:\n${box2}` : 'No additional context provided.'}
-
-Generate this exact JSON structure:
 {
-  "name": "their first name if found in the input, otherwise null",
-  "headline": "one punchy line under 10 words that captures who they are",
-  "mainPitch": "1-4 sentences. Starts with value. Specific. No buzzwords.",
-  "bio": "2-3 sentences. Third person. Professional but human.",
-  "qaContext": [
-    {"q": "realistic question a visitor would ask", "a": "answer in their voice, first person, 2-3 sentences, confident"},
-    {"q": "...", "a": "..."},
-    {"q": "...", "a": "..."},
-    {"q": "...", "a": "..."},
-    {"q": "...", "a": "..."}
-  ]
+  "headline": "One punchy line. Their positioning in the world. Not a job title. Something that makes someone lean in. Max 10 words.",
+  "pitch": "The main pitch. 2-4 sentences. Opens with value. Specific. No em dashes.",
+  "bio": "A short written bio. 2-3 sentences. Third person. Reads like something a journalist would write about them. Used on the page below the pitch.",
+  "context": "Everything about this person written as a detailed paragraph. This will be used to answer questions visitors ask. Include: what they do, who they help, their results or proof, their style or approach, what they want next. Be detailed — this powers the Q&A."
 }`;
 
+  const userMessage = `What I do:\n${box1.trim()}${box2 && box2.trim() ? '\n\nResults and experience:\n' + box2.trim() : ''}${name ? '\n\nMy name: ' + name : ''}`;
+
   try {
-    console.log('Generating pitch for:', userType, '| box1 length:', box1.length);
+    const raw = await callAnthropic(system, userMessage, 900);
+    const parsed = JSON.parse(raw);
 
-    const raw = await callAnthropic(systemPrompt, userPrompt, 1800);
+    parsed.headline = cleanText(parsed.headline);
+    parsed.pitch = cleanText(parsed.pitch);
+    parsed.bio = cleanText(parsed.bio);
+    parsed.context = cleanText(parsed.context);
 
-    // Strip markdown fences and em dashes as safety net
-    const cleaned = raw
-      .replace(/```json\n?/g, '')
-      .replace(/```\n?/g, '')
-      .replace(/\u2014/g, '.')
-      .replace(/--/g, '.')
-      .trim();
-
-    const result = JSON.parse(cleaned);
-
-    console.log('Pitch generated for:', result.name || '(no name found)');
-
-    res.json({
-      name: result.name || null,
-      headline: result.headline,
-      mainPitch: result.mainPitch,
-      bio: result.bio,
-      qaContext: result.qaContext || []
-    });
+    res.json(parsed);
   } catch (err) {
     console.error('Generate error:', err);
-    res.status(500).json({ error: 'Failed to generate pitch', details: err.message });
+    res.status(500).json({ error: 'Failed to generate. Please try again.' });
   }
 });
 
 // ─── POST /ask ────────────────────────────────────────────
 app.post('/ask', async (req, res) => {
-  const { personContext, question } = req.body;
+  const { question, context, pitch, name, userType } = req.body;
 
-  if (!question || !personContext) {
-    return res.status(400).json({ error: 'question and personContext are required' });
+  if (!question || !context) {
+    return res.status(400).json({ error: 'Missing question or context.' });
   }
 
-  const { name, userType, headline, mainPitch, bio, qaContext, rawInput } = personContext;
-  const displayName = name || 'this person';
+  const displayName = name ? name.split(' ')[0].replace('@', '') : 'this person';
 
-  const systemPrompt = `You are answering questions on behalf of a specific person. You speak as them, in first person.
-Rules:
-- Use only what is provided, plus logical inference
-- Never invent credentials, companies, or specific facts not in the context
-- Keep answers to 2-3 sentences maximum
-- Sound like someone confident answering a question at a networking event. Not a bot.
-- No bullet points. No em dashes. Short sentences.
-- If you truly do not know something, say so briefly and pivot to what you do know.
-- Return only the answer text. No preamble. No opener like "As ${displayName}".`;
+  const system = `You are ${displayName}. Someone is visiting your personal pitch page and has asked you a question. Answer in first person, naturally and confidently, as yourself.
 
-  const contextParts = [
-    `About ${displayName}:`,
-    `Type: ${userType || 'Professional'}`,
-    `Headline: ${headline}`,
-    `Main pitch: ${mainPitch}`,
-    `Bio: ${bio}`,
-    rawInput?.box1 ? `What they do: ${rawInput.box1}` : '',
-    rawInput?.box2 ? `Background/results: ${rawInput.box2}` : '',
-    qaContext?.length > 0
-      ? `Additional context:\n${qaContext.map(qa => `Q: ${qa.q}\nA: ${qa.a}`).join('\n\n')}`
-      : ''
-  ].filter(Boolean).join('\n');
+Your background:
+${context}
 
-  const userPrompt = `${contextParts}
+Your pitch:
+${pitch}
 
-Visitor's question: ${question}
+RULES FOR ANSWERING:
+- Answer in first person ("I", "my", "me")
+- Be direct and confident. You know who you are.
+- Keep answers short: 2 to 3 sentences maximum
+- Use only information from the context provided. Do not invent credentials or fake specifics.
+- If asked something you genuinely do not know, say so briefly and redirect to what you do know
+- Sound like a real person answering, not a bot
+- No em dashes. No bullet points. No lists.
+- No corporate language or buzzwords
 
-Answer in first person as ${displayName}. 2-3 sentences maximum.`;
+Return ONLY valid JSON: {"answer": "..."}`;
+
+  const userMessage = `Question: ${question}`;
 
   try {
-    const raw = await callAnthropic(systemPrompt, userPrompt, 300);
-
-    const answer = raw
-      .replace(/\u2014/g, '.')
-      .replace(/--/g, '.')
-      .trim();
-
-    console.log('Question answered for:', displayName);
-
-    res.json({ answer });
+    const raw = await callAnthropic(system, userMessage, 300);
+    const parsed = JSON.parse(raw);
+    parsed.answer = cleanText(parsed.answer);
+    res.json(parsed);
   } catch (err) {
     console.error('Ask error:', err);
-    res.status(500).json({ error: 'Failed to generate answer', details: err.message });
+    res.status(500).json({ error: 'Could not answer that right now.' });
   }
 });
 
-// ─── OAuth: Step 1 — Redirect user to Atlassian ──────────
-app.get('/auth', (req, res) => {
-  const scopes = [
-    'read:jira-work',
-    'read:jira-user',
-    'read:issue:jira',
-    'read:project:jira',
-    'read:issue-details:jira',
-    'read:jql:jira',
-    'read:sprint:jira-software',
-    'read:board-scope:jira-software',
-    'read:user:jira',
-    'offline_access'
-  ].join(' ');
-
-  const authUrl = `https://auth.atlassian.com/authorize?audience=api.atlassian.com&client_id=${CLIENT_ID}&scope=${encodeURIComponent(scopes)}&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&response_type=code&prompt=consent`;
-
-  console.log('Redirecting to Atlassian OAuth...');
-  res.redirect(authUrl);
-});
-
-// ─── OAuth: Step 2 — Exchange code for token ──────────────
-app.get('/callback', async (req, res) => {
-  const { code } = req.query;
-
-  if (!code) {
-    console.error('No auth code received');
-    return res.redirect(`${FRONTEND_URL}#error=no_code`);
-  }
-
-  try {
-    console.log('Exchanging auth code for token...');
-
-    const tokenRes = await fetch('https://auth.atlassian.com/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        code: code,
-        redirect_uri: CALLBACK_URL
-      })
-    });
-
-    const tokenData = await tokenRes.json();
-
-    if (tokenData.error) {
-      console.error('Token error:', tokenData);
-      return res.redirect(`${FRONTEND_URL}#error=${tokenData.error}`);
-    }
-
-    console.log('Token obtained successfully');
-    console.log('Scopes granted:', tokenData.scope);
-
-    const params = new URLSearchParams({
-      access_token: tokenData.access_token,
-      token_type: tokenData.token_type || 'Bearer'
-    });
-
-    if (tokenData.refresh_token) {
-      params.append('refresh_token', tokenData.refresh_token);
-    }
-
-    res.redirect(`${FRONTEND_URL}#${params.toString()}`);
-  } catch (err) {
-    console.error('OAuth callback error:', err);
-    res.redirect(`${FRONTEND_URL}#error=token_exchange_failed`);
-  }
-});
-
-// ─── Helper: Extract Bearer token ─────────────────────────
-function getToken(req) {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) return null;
-  return auth.split(' ')[1];
-}
-
-// ─── Jira: Fetch issues ────────────────────────────────────
-app.get('/jira/issues', async (req, res) => {
-  const token = getToken(req);
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-
-  try {
-    console.log('Fetching Jira issues...');
-
-    const jql = encodeURIComponent('project = SCRUM ORDER BY updated DESC');
-    const fields = 'summary,status,description,assignee,priority,created,updated,sprint';
-    const url = `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/search?jql=${jql}&maxResults=50&fields=${fields}`;
-
-    const issuesRes = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
-    });
-
-    const issuesData = await issuesRes.json();
-    console.log('Total issues found:', issuesData.total);
-
-    if (issuesData.total === 0) {
-      console.log('Zero issues with project filter. Trying broad query...');
-
-      const fallbackUrl = `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/search?jql=${encodeURIComponent('ORDER BY updated DESC')}&maxResults=50&fields=${fields}`;
-      const fallbackRes = await fetch(fallbackUrl, {
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
-      });
-      const fallbackData = await fallbackRes.json();
-      console.log('Fallback total:', fallbackData.total);
-
-      if (fallbackData.total > 0) {
-        return res.json(categorizeIssues(fallbackData));
-      }
-    }
-
-    res.json(categorizeIssues(issuesData));
-  } catch (err) {
-    console.error('Error fetching issues:', err);
-    res.status(500).json({ error: 'Failed to fetch issues', details: err.message });
-  }
-});
-
-// ─── Helper: Categorize issues by status ──────────────────
-function categorizeIssues(issuesData) {
-  const toDo = [], inProgress = [], done = [], blocked = [];
-
-  if (issuesData.issues && issuesData.issues.length > 0) {
-    issuesData.issues.forEach(issue => {
-      const statusName = issue.fields.status?.name?.toLowerCase() || '';
-      const statusCategory = issue.fields.status?.statusCategory?.key?.toLowerCase() || '';
-
-      const item = {
-        key: issue.key,
-        summary: issue.fields.summary,
-        status: issue.fields.status?.name,
-        statusCategory: issue.fields.status?.statusCategory?.name,
-        assignee: issue.fields.assignee?.displayName || 'Unassigned',
-        priority: issue.fields.priority?.name || 'None',
-        description: issue.fields.description,
-        created: issue.fields.created,
-        updated: issue.fields.updated
-      };
-
-      if (statusName.includes('block')) {
-        blocked.push(item);
-      } else if (statusCategory === 'done' || statusName === 'done') {
-        done.push(item);
-      } else if (statusCategory === 'indeterminate' || statusName === 'in progress' || statusName.includes('progress')) {
-        inProgress.push(item);
-      } else {
-        toDo.push(item);
-      }
-    });
-  }
-
-  return { total: issuesData.total || 0, toDo, inProgress, done, blocked };
-}
-
-// ─── Debug endpoints ───────────────────────────────────────
-app.get('/debug-jira', async (req, res) => {
-  const token = getToken(req);
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-
-  try {
-    const resourcesRes = await fetch('https://api.atlassian.com/oauth/token/accessible-resources', {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
-    });
-    const resources = await resourcesRes.json();
-
-    const scopeRes = await fetch('https://api.atlassian.com/me', {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
-    });
-    const me = await scopeRes.json();
-
-    res.json({
-      user: me,
-      accessibleResources: resources,
-      cloudIdUsed: CLOUD_ID,
-      cloudIdMatch: resources.some(r => r.id === CLOUD_ID)
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/debug-projects', async (req, res) => {
-  const token = getToken(req);
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-
-  try {
-    const response = await fetch(
-      `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/project`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-    );
-    const data = await response.json();
-    res.json({ count: Array.isArray(data) ? data.length : 0, projects: data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/debug-issue/:issueKey', async (req, res) => {
-  const token = getToken(req);
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-
-  try {
-    const response = await fetch(
-      `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/issue/${req.params.issueKey}`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-    );
-    res.json(await response.json());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/debug-permissions', async (req, res) => {
-  const token = getToken(req);
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-
-  try {
-    const response = await fetch(
-      `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/2/mypermissions?permissions=BROWSE_PROJECTS,READ_PROJECT,VIEW_WORKFLOW_READONLY`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-    );
-    res.json(await response.json());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── Start Server ─────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`PitchYou backend running on port ${PORT}`);
   console.log(`Frontend: ${FRONTEND_URL}`);
-  console.log(`Callback: ${CALLBACK_URL}`);
-  console.log(`Cloud ID: ${CLOUD_ID}`);
 });
